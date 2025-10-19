@@ -1,7 +1,7 @@
 import os
 import time
 
-from opendbc.car import gen_empty_fingerprint
+from opendbc.car import gen_empty_fingerprint, get_safety_config
 from opendbc.car.can_definitions import CanRecvCallable, CanSendCallable
 from opendbc.car.carlog import carlog
 from opendbc.car.structs import CarParams, CarParamsT
@@ -39,6 +39,34 @@ def _get_interface_names() -> dict[str, list[str]]:
 # imports from directory opendbc/car/<name>/
 interface_names = _get_interface_names()
 interfaces = load_interfaces(interface_names)
+
+
+def _prioritize_external_panda_safety_configs(cp: CarParams, num_pandas: int) -> None:
+  """
+  When multiple pandas are present (e.g. comma three with an external red panda),
+  we want the primary (first) panda to run the active safety model while any
+  remaining pandas stay silent. Interfaces that already tailor multi-panda
+  configs (e.g. CAN-FD) will typically define more than one active config;
+  in that case we leave the ordering alone.
+  """
+  if num_pandas <= 1:
+    return
+
+  active_configs = [cfg for cfg in cp.safetyConfigs if cfg.safetyModel != CarParams.SafetyModel.noOutput]
+  if len(active_configs) != 1:
+    # Multiple active safety configs are intentional (e.g. dual panda setups that
+    # really use both). Leave them alone in that case.
+    return
+
+  # Build list so the primary panda keeps the active safety config
+  # and every additional panda runs the noOutput policy.
+  no_output_needed = max(0, num_pandas - 1)
+  cp.safetyConfigs = active_configs + [
+    get_safety_config(CarParams.SafetyModel.noOutput) for _ in range(no_output_needed)
+  ]
+  carlog.info({"event": "external_panda_prioritized",
+               "num_pandas": num_pandas,
+               "active_safety_model": str(active_configs[0].safetyModel)})
 
 
 def can_fingerprint(can_recv: CanRecvCallable) -> tuple[str | None, dict[int, dict]]:
@@ -163,6 +191,7 @@ def get_car(can_recv: CanRecvCallable, can_send: CanSendCallable, set_obd_multip
 
   CarInterface = interfaces[candidate]
   CP: CarParams = CarInterface.get_params(candidate, fingerprints, car_fw, alpha_long_allowed, is_release, docs=False)
+  _prioritize_external_panda_safety_configs(CP, num_pandas)
   CP.carVin = vin
   CP.carFw = car_fw
   CP.fingerprintSource = source
